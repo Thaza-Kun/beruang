@@ -1,97 +1,122 @@
 //! A finance manager for bears and people with money.
+mod ledger;
+mod read_excel;
 
-#![warn(missing_docs)]
+use crate::ledger::Ledger;
+use itertools::Itertools;
+use ledger::TimeGroup;
+use polars::prelude::*;
 
-use std::{error::Error, fs::OpenOptions, io::Write, path::Path};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use chrono::NaiveDate;
-use clap::{Parser, ValueEnum};
-use csv;
-use serde::{Deserialize, Serialize};
+#[derive(Parser)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
 
-#[derive(Parser, Debug, Serialize, Deserialize)]
-struct TransactionParser {
-    #[arg(allow_hyphen_values = true)]
-    total: i64,
-    category: Category,
-    participant: String,
-    #[arg(short, long, default_value_t = String::from("MAYB"))]
-    account: String,
-    #[arg(long, default_value_t = String::from("MYR"))]
-    currency: String,
-    #[arg(short, long)]
-    details: String,
-    #[arg(long)]
-    date: NaiveDate,
-    #[serde(skip)]
-    #[arg(long, default_value_t = String::from("transactions.csv"))]
+#[derive(Subcommand)]
+enum Commands {
+    /// Combines multiple excel sheets into a single dataframe. Optionally converts to Parquet or CSV.
+    Combine(ReadExcel),
+    /// Do some accounting
+    #[command(subcommand)]
+    Ledger(LedgerAction),
+}
+
+#[derive(Args)]
+struct LedgerOpts {
+    /// Filename (Parquet format)
     file: String,
+    /// Choose time blocks for aggregation
+    #[arg(value_enum, short, long)]
+    temporal: TimeGroup,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Transaction {
-    date: NaiveDate,
-    details: String,
-    account: String,
-    category: Category,
-    participant: String,
-    currency: String,
-    total: String,
+#[derive(Subcommand)]
+enum LedgerAction {
+    /// Summarizes accounts for the whole duration.
+    Summary(LedgerOpts),
+    /// Sums the total for the selected time blocks.
+    Nett(LedgerOpts),
 }
 
-impl Transaction {
-    fn from_parser(parser: &TransactionParser) -> Transaction {
-        let mut str_total = parser.total.clone().to_string();
-        let length = str_total.chars().count();
-        str_total.insert(length - 2, '.');
+#[derive(Clone, ValueEnum)]
+enum DataIOFormat {
+    Parquet,
+    Csv,
+}
 
-        Transaction {
-            date: parser.date.clone(),
-            details: parser.details.clone(),
-            account: parser.account.clone(),
-            category: parser.category.clone(),
-            participant: parser.participant.clone(),
-            currency: parser.currency.clone(),
-            total: str_total,
+#[derive(Args)]
+struct ReadExcel {
+    /// Path to file.
+    #[arg(short)]
+    file: String,
+    /// Sheets to read. Defaults to all months.
+    #[arg(short)]
+    sheets: Vec<String>,
+    /// Parquet file to convert. Leave empty to display dataframe.
+    #[arg(short)]
+    output: Option<String>,
+    /// Format for export.
+    #[arg(short, long)]
+    export: DataIOFormat,
+}
+
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mac", "Apr", "Mei", "Jun", "Jul", "Ogo", "Sep", "Okt", "Nov", "Dis",
+];
+
+fn main() {
+    let app = Cli::parse();
+
+    match &app.command {
+        Commands::Combine(ReadExcel {
+            file,
+            sheets,
+            output,
+            export,
+        }) => {
+            let sheets = if sheets.is_empty() {
+                MONTHS.into_iter().map(|s| String::from(s)).collect_vec()
+            } else {
+                sheets.to_vec()
+            };
+            let mut df = read_excel::timeseries_from_excel(
+                &file,
+                sheets.iter().map(|a| a.as_str()).collect_vec().as_slice(),
+            )
+            .expect(&format!("Unable to read file {}", &file));
+            match output {
+                Some(file) => match export {
+                    DataIOFormat::Parquet => {
+                        let mut file = std::fs::File::create(file).unwrap();
+                        ParquetWriter::new(&mut file).finish(&mut df).unwrap();
+                    }
+                    DataIOFormat::Csv => read_excel::timeseries_to_csv(df.lazy(), file).unwrap(),
+                },
+                None => println!("{}", df),
+            }
         }
-    }
-}
-
-#[derive(Clone, ValueEnum, Debug, Serialize, Deserialize)]
-enum Category {
-    Makan,
-    Kebersihan,
-    Keluarga,
-    Kesihatan,
-    Khidmat,
-    Pelaburan,
-    Pengangkutan,
-    Rencam,
-    Pendapatan,
-    Upah,
-    Hadiah,
-    Perbelanjaan,
-    Hutang,
-    Hiburan,
-    #[serde(rename = "Alat Kerja")]
-    AlatKerja,
-    Pendidikan,
-    Simpanan,
-}
-
-fn main() -> Result<(), Box<dyn Error>> {
-    let app = TransactionParser::parse();
-    let file_existed = dbg!(Path::new(&app.file).exists());
-    let mut file = OpenOptions::new()
-        .read(true)
-        .append(true)
-        .create(true)
-        .open(&app.file)?;
-    let mut writer = csv::WriterBuilder::new()
-        .has_headers(!file_existed)
-        .from_writer(vec![]);
-    writer.serialize(Transaction::from_parser(&app))?;
-    let data = String::from_utf8(writer.into_inner()?)?;
-    file.write(dbg!(data).as_bytes())?;
-    Ok(())
+        Commands::Ledger(action) => match action {
+            LedgerAction::Summary(opts) => {
+                println!(
+                    "{}",
+                    Ledger::load_parquet(&opts.file)
+                        .expect(&format!("Unable to read file {}", &opts.file))
+                        .summarize()
+                        .collect()
+                        .expect("Unable to collect LazyFrame.")
+                )
+            }
+            LedgerAction::Nett(opts) => println!(
+                "{}",
+                Ledger::load_parquet(&opts.file)
+                    .expect(&format!("Unable to read file {}", &opts.file))
+                    .nett(opts.temporal, "Pertukaran")
+                    .collect()
+                    .expect("Unable to collect LazyFrame")
+            ),
+        },
+    };
 }
