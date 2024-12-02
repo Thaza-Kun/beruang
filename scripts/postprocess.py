@@ -7,10 +7,9 @@
 # ///
 
 import pathlib
+from typing import List
 import typer
 import polars as pl
-from dataclasses import dataclass
-
 
 @dataclass
 class Data:
@@ -18,22 +17,13 @@ class Data:
     title: str
     note: str = ""
 
-
-# TODO: MAP[str, dict()]
-description_map = {
-    "Dvends Tech": Data(title="Mesin Gedegang", category="Jajan"),
-    "AMRANCAFE10": Data(title="Makan", category="Makan"),
-    "MEGA LIMITED": Data(title="Storan Awan", category="Khidmat", note="Mega NZ"),
-    "VILLAGE GROCER": Data(title="Makan", category="Makan", note="Village Grocer"),
-    "WASHUPPTECH": Data(title="Dobi", category="Dobi"),
-}
-
-
 def main(
     input: pathlib.Path,
     output: pathlib.Path,
     correction: pathlib.Path,
     preview: bool = False,
+    typeignore: List[str] = [],
+    descignore: List[str] = []
 ) -> None:
     corr = pl.scan_csv(correction)
     lf = (
@@ -42,11 +32,11 @@ def main(
             new_columns=["Date", "Type", "Description", "Amount", "Balance", "Flow"],
             schema_overrides=[pl.Date],
         )
-        .filter(~pl.col("Type").str.contains_any(["PRE-AUTH", "PREAUTH"]))
-        .filter(~pl.col("Description").str.contains("Shopee"))
+        .filter(~pl.col("Type").str.contains_any(typeignore))
+        .filter(~pl.col("Description").str.contains_any(descignore))
         .with_columns(
-            pl.when(pl.col("Type").eq("CASH DEPOSIT"))
-            .then(pl.lit("CASH DEPOSIT").alias("Description"))
+            pl.when(pl.col("Description").eq(""))
+            .then(pl.col("Type").alias("Description"))
             .otherwise(pl.col("Description"))
         )
         .select(
