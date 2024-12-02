@@ -1,0 +1,3 @@
+[submodule "external/maepdf"]
+	path = external/maepdf
+	url = https://github.com/OAT7963/mae_pdf_processing.git
